@@ -16,8 +16,10 @@ import time
 import socket
 import re
 import io
+import select
 from os import path
 from threading import Lock
+from functools import wraps
 
 from netmiko.netmiko_globals import MAX_BUFFER, BACKSPACE_CHAR
 from netmiko.ssh_exception import NetMikoTimeoutException, NetMikoAuthenticationException
@@ -220,35 +222,44 @@ class BaseConnection(object):
             # Always unlock the SSH channel, even on exception.
             self._unlock_netmiko_session()
 
-    def _read_channel(self):
+    def _read_channel(self, timeout=None):
         """Generic handler that will read all the data from an SSH or telnet channel."""
-        if self.protocol == 'ssh':
-            output = ""
-            while True:
-                if self.remote_conn.recv_ready():
-                    outbuf = self.remote_conn.recv(MAX_BUFFER)
-                    if len(outbuf) == 0:
-                        raise EOFError("Channel stream closed by remote device.")
-                    output += outbuf.decode('utf-8', 'ignore')
-                else:
-                    break
-        elif self.protocol == 'telnet':
-            output = self.remote_conn.read_very_eager().decode('utf-8', 'ignore')
-        log.debug("read_channel: {}".format(output))
-        return output
+        if timeout is None:
+            timeout = self.timeout
 
-    def read_channel(self):
+        output = b''
+        rfd, _, _ = select.select([self.remote_conn], [], [], timeout)
+        while len(rfd) > 0:
+            if self.protocol == 'ssh':
+                obuf = self.remote_conn.recv(MAX_BUFFER)
+            elif self.protocol == 'telnet':
+                obuf = self.remote_conn.read_very_eager()
+            else:
+                raise ValueError('Invalid protocol {}'.format(self.protocol))
+
+            if len(obuf) == 0:
+                raise EOFError('Channel stream closed by remote device')
+
+            output += obuf
+            rfd, _, _ = self.select([self.remote_conn], [], [], 0.0)
+
+        if len(output) == 0:
+            raise NetMikoTimeoutException("Timed-out reading channel, data not available.")
+
+        return output.decode('utf-8', 'ignore')
+
+    def read_channel(self, timeout=None):
         """Generic handler that will read all the data from an SSH or telnet channel."""
         output = ""
         self._lock_netmiko_session()
         try:
-            output = self._read_channel()
+            output = self._read_channel(timeout=timeout)
         finally:
             # Always unlock the SSH channel, even on exception.
             self._unlock_netmiko_session()
         return output
 
-    def _read_channel_expect(self, pattern='', re_flags=0, max_loops=None):
+    def _read_channel_expect(self, pattern='', re_flags=0, timeout=None):
         """
         Function that reads channel until pattern is detected.
 
@@ -265,40 +276,23 @@ class BaseConnection(object):
         debug = False
         output = ''
         if not pattern:
-            pattern = re.escape(self.base_prompt)
+            pattern = re.compile(re.escape(self.base_prompt))
         if debug:
             print("Pattern is: {}".format(pattern))
 
-        # Will loop for self.timeout time (override with max_loops argument)
-        i = 1
-        loop_delay = .1
-        if not max_loops:
-            max_loops = self.timeout / loop_delay
-        while i < max_loops:
-            if self.protocol == 'ssh':
-                try:
-                    # If no data available will wait timeout seconds trying to read
-                    self._lock_netmiko_session()
-                    new_data = self.remote_conn.recv(MAX_BUFFER)
-                    if len(new_data) == 0:
-                        raise EOFError("Channel stream closed by remote device.")
-                    new_data = new_data.decode('utf-8', 'ignore')
-                    log.debug("_read_channel_expect read_data: {}".format(new_data))
-                    output += new_data
-                except socket.timeout:
-                    raise NetMikoTimeoutException("Timed-out reading channel, data not available.")
-                finally:
-                    self._unlock_netmiko_session()
-            elif self.protocol == 'telnet':
-                output += self.read_channel()
-            if re.search(pattern, output, flags=re_flags):
+        if not timeout:
+            timeout = self.timeout
+
+        start_time = time.time()
+
+        while (time.time() - start_time) < timeout:
+            output += self.read_channel(timeout=timeout)
+            if pattern.search(output, flags=re_flags):
                 if debug:
-                    print("Pattern found: {} {}".format(pattern, output))
+                    print("Pattern found: {} {}".format(pattern.pattern, output))
                 return output
-            time.sleep(loop_delay * self.global_delay_factor)
-            i += 1
+
         raise NetMikoTimeoutException("Timed-out reading channel, pattern not found in output: {}"
-                                      .format(pattern))
 
     def _read_channel_timing(self, delay_factor=1, max_loops=150):
         """
