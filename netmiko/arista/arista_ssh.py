@@ -22,6 +22,8 @@ class AristaSSH(CiscoSSHConnection):
         debug = False
         if debug:
             print("pattern: {}".format(pattern))
+        if not pattern:
+            pattern = self._config_prompt_pattern()
         self.write_channel('\n')
         output = self.read_until_pattern(pattern=pattern)
         if debug:

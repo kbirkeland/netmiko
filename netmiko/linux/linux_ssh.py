@@ -10,17 +10,14 @@ from netmiko.ssh_exception import NetMikoTimeoutException
 
 class LinuxSSH(CiscoSSHConnection):
 
+    def __init__(self, *args, **kwargs):
+        if 'prompt_terminators' not in kwargs:
+            kwargs['prompt_terminators'] = ['$', '#', '%', '>']
+        return super(CiscoSSHConnection, self).__init__(*args, **kwargs)
+
     def disable_paging(self, *args, **kwargs):
         """Linux doesn't have paging by default."""
         return ""
-
-    def set_base_prompt(self, pri_prompt_terminator='$',
-                        alt_prompt_terminator='#', delay_factor=1):
-        """Determine base prompt."""
-        return super(CiscoSSHConnection, self).set_base_prompt(
-            pri_prompt_terminator=pri_prompt_terminator,
-            alt_prompt_terminator=alt_prompt_terminator,
-            delay_factor=delay_factor)
 
     def send_config_set(self, config_commands=None, exit_config_mode=True, **kwargs):
         """Can't exit from root (if root)"""

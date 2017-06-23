@@ -28,10 +28,6 @@ from netmiko.py23_compat import string_types
 from netmiko import log
 
 
-def LOG(msg):
-    #print('{:.2f} {}'.format(time.time() % 86400, msg))
-    pass
-
 class BaseConnection(object):
     """
     Defines vendor independent methods.
@@ -41,7 +37,7 @@ class BaseConnection(object):
     def __init__(self, ip='', host='', username='', password='', secret='', port=None,
                  device_type='', verbose=False, global_delay_factor=1, use_keys=False,
                  key_file=None, allow_agent=False, ssh_strict=False, system_host_keys=False,
-                 alt_host_keys=False, alt_key_file='', ssh_config_file=None, timeout=8,
+                 alt_host_keys=False, alt_key_file='', ssh_config_file=None, timeout=15,
                  session_timeout=60, keepalive=0, prompt_terminators=['>', '#']):
         """
         Initialize attributes for establishing connection to target device.
@@ -87,7 +83,7 @@ class BaseConnection(object):
         :type alt_key_file: str
         :param ssh_config_file: File name of OpenSSH configuration file.
         :type ssh_config_file: str
-        :param timeout: Connection timeout.
+        :param timeout: Connection/command timeout.
         :type timeout: float
         :param session_timeout: Set a timeout for parallel requests.
         :type session_timeout: float
@@ -96,9 +92,8 @@ class BaseConnection(object):
                 to keep the connection alive).
         :type keepalive: int
         :param prompt_terminators: Terminators found at the end of the prompt
-        :type prompt_terminators: [str]
+        :type prompt_terminators: List[str]
         """
-        LOG('init()')
         if ip:
             self.host = ip
             self.ip = ip
@@ -130,10 +125,13 @@ class BaseConnection(object):
         # set in set_base_prompt method
         self.base_prompt = ''
 
+        self.end = '\n'
+
         self._session_locker = Lock()
         # determine if telnet or SSH
         if '_telnet' in device_type:
             self.protocol = 'telnet'
+            self.end = '\r\n'
             self._modify_connection_params()
             self.establish_connection()
             self.session_preparation()
@@ -158,9 +156,7 @@ class BaseConnection(object):
 
             self._modify_connection_params()
             self.establish_connection()
-            LOG('connection established')
             self.session_preparation()
-        LOG('init() done')
 
     def __enter__(self):
         """Establish a session using a Context Manager."""
@@ -174,7 +170,6 @@ class BaseConnection(object):
 
     def _modify_connection_params(self):
         """Modify connection parameters prior to SSH connection."""
-        LOG('_modify_connection_params')
         pass
 
     def _timeout_exceeded(self, start, msg='Timeout exceeded!'):
@@ -222,7 +217,6 @@ class BaseConnection(object):
 
     def write_channel(self, out_data):
         """Generic handler that will write to both SSH and telnet channel."""
-        LOG('write_channel({!r})'.format(out_data))
         self._lock_netmiko_session()
         try:
             self._write_channel(out_data)
@@ -251,16 +245,10 @@ class BaseConnection(object):
             output += obuf
             rfd, _, _ = select.select([self.remote_conn], [], [], 0.0)
 
-        log.debug("read_channel: {!r}".format(write_bytes(output)))
-        if len(output) == 0:
-            #raise NetMikoTimeoutException("Timed-out reading channel, data not available.")
-            return ''
-
         return output.decode('utf-8', 'ignore')
 
     def read_channel(self, timeout=None):
         """Generic handler that will read all the data from an SSH or telnet channel."""
-        LOG('read_channel({})'.format(timeout))
         output = ""
         self._lock_netmiko_session()
         try:
@@ -268,6 +256,7 @@ class BaseConnection(object):
         finally:
             # Always unlock the SSH channel, even on exception.
             self._unlock_netmiko_session()
+        log.debug('read_channel: {!r}'.format(output))
         return output
 
     def _read_channel_expect(self, pattern='', re_flags=0, timeout=None):
@@ -284,34 +273,30 @@ class BaseConnection(object):
         There are dependencies here like determining whether in config_mode that are actually
         depending on reading beyond pattern.
         """
-        LOG('read_channel_expect({!r}, {}, {})'.format(pattern, re_flags, timeout))
-        debug = False
+        log.debug('expecting {!r}'.format(pattern))
         output = ''
         if not pattern:
-            pattern = re.compile(self._base_prompt_pattern())
+            pattern = re.compile(self._prompt_pattern())
         else:
             pattern = re.compile(pattern, flags=re_flags)
-
-        if debug:
-            print("Pattern is: {!r}".format(pattern.pattern))
 
         if not timeout:
             timeout = self.timeout
 
-        start_time = time.time()
+        last_time = time.time()
 
-        since_start_time = time.time() - start_time
-        while since_start_time < timeout:
-            obuf = self.read_channel(timeout=(timeout - since_start_time))
-            LOG('got {!r}'.format(obuf))
+        last_time_delta = time.time() - last_time
+        while last_time_delta < timeout:
+            obuf = self.read_channel(timeout=(timeout - last_time_delta))
             output += obuf
             if pattern.search(output[output.rfind('\r'):]):
-                if debug:
-                    print("Pattern found: {!r} {!r}".format(pattern.pattern, output))
                 return output
-            since_start_time = time.time() - start_time
+            if len(obuf) > 0:
+                last_time = time.time()
+            last_time_delta = time.time() - last_time
             time.sleep(0.001)
-        LOG('got {}'.format(output))
+
+        log.debug('Timed out after {} seconds'.format(last_time_delta))
 
         raise NetMikoTimeoutException("Timed-out reading channel, pattern not found in output: {!r} {!r}"
                                       .format(pattern.pattern, output))
@@ -341,65 +326,31 @@ class BaseConnection(object):
 
     def read_until_prompt_or_pattern(self, pattern='', re_flags=0):
         """Read until either self.base_prompt or pattern is detected. Return ALL data available."""
-        combined_pattern = self.base_prompt
+        combined_pattern = self._prompt_pattern()
         if pattern:
             combined_pattern += "|{}".format(pattern)
         return self._read_channel_expect(combined_pattern, re_flags=re_flags)
 
-    def telnet_login(self, pri_prompt_terminator='#', alt_prompt_terminator='>',
-                     username_pattern=r"sername", pwd_pattern=r"assword",
-                     delay_factor=1, max_loops=60):
-        """Telnet login. Can be username/password or just password."""
-        TELNET_RETURN = '\r\n'
+    def telnet_login(self, username_pattern=r'sername', pwd_pattern=r'assword',
+                     timeout=None):
+        login_pattern = '({}|{})'.format(re.escape(username_pattern),
+                                         re.escape_pwd_pattern)
+        try:
+            output = self._read_channel_expect(pattern=login_pattern)
+            if username_pattern in output:
+                output = send_command(self.username, expect_string=login_pattern)
+            if pwd_pattern in output:
+                output = self.send_command(self.password, auto_find_prompt=True)
 
-        delay_factor = self.select_delay_factor(delay_factor)
-        time.sleep(1 * delay_factor)
-
-        output = ''
-        return_msg = ''
-        i = 1
-        while i <= max_loops:
-            try:
-                output = self.read_channel()
-                return_msg += output
-
-                # Search for username pattern / send username
-                if re.search(username_pattern, output):
-                    self.write_channel(self.username + TELNET_RETURN)
-                    time.sleep(1 * delay_factor)
-                    output = self.read_channel()
-                    return_msg += output
-
-                # Search for password pattern / send password
-                if re.search(pwd_pattern, output):
-                    self.write_channel(self.password + TELNET_RETURN)
-                    time.sleep(.5 * delay_factor)
-                    output = self.read_channel()
-                    return_msg += output
-                    if pri_prompt_terminator in output or alt_prompt_terminator in output:
-                        return return_msg
-
-                # Check if proper data received
-                if pri_prompt_terminator in output or alt_prompt_terminator in output:
-                    return return_msg
-
-                self.write_channel(TELNET_RETURN)
-                time.sleep(.5 * delay_factor)
-                i += 1
-            except EOFError:
-                msg = "Telnet login failed: {0}".format(self.host)
+            if not self.base_prompt:
+                msg = 'Telnet authentication failed: {0}'.format(self.host)
                 raise NetMikoAuthenticationException(msg)
 
-        # Last try to see if we already logged in
-        self.write_channel(TELNET_RETURN)
-        time.sleep(.5 * delay_factor)
-        output = self.read_channel()
-        return_msg += output
-        if pri_prompt_terminator in output or alt_prompt_terminator in output:
-            return return_msg
+            return output
 
-        msg = "Telnet login failed: {0}".format(self.host)
-        raise NetMikoAuthenticationException(msg)
+        except (socket.error, EOFError):
+            msg = 'Telnet login failed: {0}'.format(self.host)
+            raise NetMikoAuthenticationException(msg)
 
     def session_preparation(self):
         """
@@ -414,7 +365,6 @@ class BaseConnection(object):
         self.disable_paging()
         self.set_terminal_width()
         """
-        LOG('session_preparation()')
         self._test_channel_read()
         self.set_base_prompt()
         self.disable_paging()
@@ -493,7 +443,6 @@ class BaseConnection(object):
 
         width and height are needed for Fortinet paging setting.
         """
-        LOG('establish_connection()')
         if self.protocol == 'telnet':
             self.remote_conn = telnetlib.Telnet(self.host, port=self.port, timeout=self.timeout)
             self.telnet_login()
@@ -568,7 +517,7 @@ class BaseConnection(object):
         """Disable paging default to a Cisco CLI method."""
         return self.send_command(command)
 
-    def set_terminal_width(self, command="", delay_factor=1):
+    def set_terminal_width(self, command="", timeout=None):
         """
         CLI terminals try to automatically adjust the line based on the width of the terminal.
         This causes the output to get distorted when accessed programmatically.
@@ -577,77 +526,71 @@ class BaseConnection(object):
         """
         if not command:
             return ""
-        return self.send_command(command)
+        return self.send_command(command, timeout=timeout)
 
-    def set_base_prompt(self, pri_prompt_terminator='#',
-                        alt_prompt_terminator='>', delay_factor=1):
+    def set_base_prompt(self, timeout=None):
         """
         Sets self.base_prompt
 
-        Used as delimiter for stripping of trailing prompt in output.
-
-        Should be set to something that is general and applies in multiple contexts. For Cisco
-        devices this will be set to router hostname (i.e. prompt without '>' or '#').
+        Uses self.prompt_terminators as delimiters for end of prompt
 
         This will be set on entering user exec or privileged exec on Cisco, but not when
         entering/exiting config mode.
         """
-        self.base_prompt = self.find_prompt(delay_factor=delay_factor)
+        self.base_prompt = self.find_prompt(timeout=timeout)
         return self.base_prompt
 
-    def _base_prompt_pattern(self):
+    def _prompt_pattern(self, prompt=None):
+        """
+        Returns the escaped regex pattern for prompt
+
+        :param prompt: Prompt to search for. Defaults to self.base_prompt
+        :type prompt: str
+        """
+        if prompt is None:
+            prompt = self.base_prompt
         if len(self.prompt_terminators) > 0:
-            return '{}.*[{}]'.format(self.base_prompt, ''.join(self.prompt_terminators))
-        return self.base_prompt
+            return '\n{}.*[{}]'.format(re.escape(prompt), ''.join(self.prompt_terminators))
+        return '\n{}'.format(re.escape(prompt))
+        
+    def _config_prompt_pattern(self):
+        """
+        Returns the escaped regex to search for config mode
+        """
+        return r'\(config[^\)]*\)'
 
-    def _find_prompt(self):
+    def _find_prompt(self, timeout=None):
         self.clear_buffer()
-        self.write_channel("\n")
-        time.sleep(.01)
-        prompt = self.read_channel(2)
+        prompt = self.send_command('', expect_string='\n[^\n]*({})'.format('|'.join(self.prompt_terminators)), timeout=timeout)
         if self.ansi_escape_codes:
             prompt = self.strip_ansi_escape_codes(prompt)
         return prompt.strip()
 
-    def find_prompt(self, delay_factor=1):
+    def find_prompt(self, timeout=None):
         """Finds the current network device prompt, last line only."""
-        LOG('find_prompt({})'.format(delay_factor))
-        debug = False
-        delay_factor = self.select_delay_factor(delay_factor)
+        # Find two consecutive prompts which are the same
+        lprompt = self._find_prompt(timeout=timeout)
+        for count in range(10):
+            prompt = self._find_prompt(timeout=timeout)
+            if lprompt == prompt:
+                break
+            lprompt = prompt
 
-        # Initial attempt to get prompt
-        prompt = self._find_prompt()
-
-        if debug:
-            print("prompt1: {!r}".format(prompt))
-
-        # Check if the only thing you received was a newline
-        count = 0
-        while count <= 10 and not prompt:
-            prompt = self._find_prompt()
-            if debug:
-                print("prompt2b: {!r}".format(prompt))
-            count += 1
-
-        if debug:
-            print("prompt3: {!r}".format(prompt))
         # If multiple lines in the output take the last line
         prompt = self.normalize_linefeeds(prompt)
-        prompt = prompt.split('\n')[-1]
+        prompt = prompt[max(0, prompt.rfind('\n')):]
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("Unable to find prompt: {}".format(prompt))
-        prompt = '\n{}'.format(prompt)
-        if prompt[-1] in ('>', '#', '%'):
+        while prompt[-1] in self.prompt_terminators:
             prompt = prompt[:-1]
         return prompt
 
     def clear_buffer(self):
-        LOG('clear_buffer()')
         """Read any data available in the channel."""
         self.read_channel(timeout=0)
 
-    def send_command_timing(self, command_string, timeout=None
+    def send_command_timing(self, command_string, timeout=None,
                             strip_prompt=True, strip_command=True, normalize=True):
         """Execute command_string on the SSH channel using a delay-based mechanism. Generally
         used for show commands.
@@ -680,16 +623,11 @@ class BaseConnection(object):
         if self.base_prompt in a_string[a_string.rfind('\n')-1:]:
             return a_string[:a_string.rfind('\n')]
         return a_string
-        response_list = a_string.split('\n')
-        last_line = response_list[-1]
-        if self.base_prompt in last_line:
-            return '\n'.join(response_list[:-1])
-        else:
-            return a_string
 
     def send_command(self, command_string, expect_string=None,
-                     delay_factor=1, max_loops=500, auto_find_prompt=True,
-                     strip_prompt=True, strip_command=True, normalize=True):
+                     timeout=None, auto_find_prompt=False,
+                     strip_prompt=True, strip_command=True, normalize=True,
+                     re_flags=0, end=None):
         """Execute command_string on the SSH channel using a pattern-based mechanism. Generally
         used for show commands. By default this method will keep waiting to receive data until the
         network device prompt is detected. The current network device prompt will be determined
@@ -700,7 +638,7 @@ class BaseConnection(object):
         :param expect_string: Regular expression pattern to use for determining end of output.
             If left blank will default to being based on router prompt.
         :type expect_str: str
-        :param timeout: Controls wait time in seconds (default: 15).
+        :param timeout: Controls wait time in seconds (default: self.timeout).
         :type timeout: int
         :param strip_prompt: Remove the trailing router prompt from the output (default: True).
         :type strip_prompt: bool
@@ -708,20 +646,30 @@ class BaseConnection(object):
         :type strip_command: bool
         :param normalize: Ensure the proper enter is sent at end of command (default: True).
         :type normalize: bool
+        :param re_flags: Flags to use when searching for pattern
+        :type re_flags: str
+        :param end: Newline character to append to the end (default: self.end)
+        :type end: str
         """
-        LOG('send_command({!r}, {!r}, {}, {}, {}, {}, {}, {})'.format(command_string, expect_string, delay_factor, max_loops, auto_find_prompt, strip_prompt, strip_command, re_flags))
-        if expect_string is None:
-            if auto_find_prompt:
-                expect_string = self.find_prompt()
-        else:
-            expect_string += '|{}'.format(self._base_prompt_pattern)
+        if auto_find_prompt:
+            expect_string_arg = expect_string
+            expect_string = self._prompt_pattern(prompt='')
+
+        if not end:
+            end = self.end
+
         if normalize:
-            command_string = self.normalize_cmd(command_string)
+            command_string = self.normalize_cmd(command_string, end=end)
+
         self.write_channel(command_string)
         time.sleep(0.01)
-        output = self._read_channel_expect(pattern=expect_string, re_flags=re_flags)
+        output = self._read_channel_expect(pattern=expect_string, re_flags=re_flags, timeout=timeout)
         output = self._sanitize_output(output, strip_command=strip_command,
                                        command_string=command_string, strip_prompt=strip_prompt)
+
+        if auto_find_prompt:
+            self.set_base_prompt()
+
         return output
 
     def send_command_expect(self, *args, **kwargs):
@@ -746,9 +694,6 @@ class BaseConnection(object):
         # Check for line wrap (remove backspaces)
         if backspace_char in output:
             output = output.replace(backspace_char, '')
-            #output_lines = output.split("\n")
-            #new_output = output_lines[1:]
-            #return "\n".join(new_output)
             return output[output.find('\n')+1:]
         else:
             command_length = len(command_string)
@@ -757,37 +702,32 @@ class BaseConnection(object):
     @staticmethod
     def normalize_linefeeds(a_string):
         """Convert '\r\r\n','\r\n', '\n\r' to '\n."""
-        #newline = re.compile(r'(\r\r\r\n|\r\r\n|\r\n|\n\r)')
         newline = re.compile(r'\r*\n\r*')
         return newline.sub('\n', a_string)
 
     @staticmethod
-    def normalize_cmd(command):
+    def normalize_cmd(command, end='\n'):
         """Normalize CLI commands to have a single trailing newline."""
-        command = command.rstrip("\n")
-        command += '\n'
+        command = command.rstrip()
+        command += end
         return command
 
     def check_enable_mode(self, check_string=''):
         """Check if in enable mode. Return boolean."""
-        debug = False
         self.write_channel('\n')
         output = self.read_until_prompt()
-        if debug:
-            print(output)
         return check_string in output
 
-    def enable(self, cmd='', pattern='password', re_flags=re.IGNORECASE):
+    def enable(self, cmd='', pattern='assword', re_flags=re.IGNORECASE):
         """Enter enable mode."""
         output = ""
         if not self.check_enable_mode():
             output = self.send_command(cmd, expect_string=pattern, re_flags=re_flags)
-            if 'assword' in output:
+            #if pattern in output:
+            if re.search(pattern, output, flags=re_flags):
                 self.send_command(self.secret, auto_find_prompt=False)
-            #self.write_channel(self.normalize_cmd(cmd))
-            #output += self.read_until_prompt_or_pattern(pattern=pattern, re_flags=re_flags)
-            #self.write_channel(self.normalize_cmd(self.secret))
-            #output += self.read_until_prompt()
+            else:
+                log.error('Failed to find pattern {!r} in output {!r}'.format(pattern, output))
             if not self.check_enable_mode():
                 raise ValueError("Failed to enter enable mode.")
         return output
@@ -797,45 +737,39 @@ class BaseConnection(object):
         output = ""
         if self.check_enable_mode():
             self.send_command(exit_command)
-            #self.write_channel(self.normalize_cmd(exit_command))
-            #output += self.read_until_prompt()
             if self.check_enable_mode():
                 raise ValueError("Failed to exit enable mode.")
         return output
 
     def check_config_mode(self, check_string='', pattern=''):
         """Checks if the device is in configuration mode or not."""
-        debug = False
-        if debug:
-            print("pattern: {}".format(pattern))
+        if not pattern:
+            pattern = self._config_prompt_pattern()
         output = self.send_command('', expect_string=pattern, strip_prompt=False, strip_command=False, auto_find_prompt=False)
-        if debug:
-            print("check_config_mode: {}".format(repr(output)))
         return check_string in output
 
     def config_mode(self, config_command='', pattern=''):
         """Enter into config_mode."""
+        if not pattern:
+            pattern = self._config_prompt_pattern()
         output = ''
         if not self.check_config_mode():
             self.send_command(config_command, expect_string=pattern, strip_prompt=False, strip_command=False, auto_find_prompt=False)
-            #self.write_channel(self.normalize_cmd(config_command))
-            #output = self.read_until_pattern(pattern=pattern)
             if not self.check_config_mode():
                 raise ValueError("Failed to enter configuration mode.")
+        log.debug('Entered config mode')
         return output
 
     def exit_config_mode(self, exit_config='', pattern=''):
         """Exit from configuration mode."""
-        debug = False
+        if not pattern:
+            pattern = self._config_prompt_pattern()
         output = ''
         if self.check_config_mode():
-            self.send_command(exit_config, expect_string=pattern, strip_prompt=False, strip_command=False, auto_find_prompt=False)
-            #self.write_channel(self.normalize_cmd(exit_config))
-            #output = self.read_until_pattern(pattern=pattern)
+            self.send_command(exit_config, expect_string=pattern, strip_prompt=False, strip_command=False, auto_find_prompt=True)
             if self.check_config_mode():
                 raise ValueError("Failed to exit configuration mode")
-        if debug:
-            print("exit_config_mode: {}".format(output))
+        log.debug('Exited config mode')
         return output
 
     def send_config_from_file(self, config_file=None, **kwargs):
@@ -860,7 +794,7 @@ class BaseConnection(object):
 
         Automatically exits/enters configuration mode.
         """
-        debug = False
+        pattern = self._config_prompt_pattern()
         delay_factor = self.select_delay_factor(delay_factor)
         if config_commands is None:
             return ''
@@ -873,17 +807,10 @@ class BaseConnection(object):
         # Send config commands
         output = self.config_mode()
         for cmd in config_commands:
-            #self.write_channel(self.normalize_cmd(cmd))
-            output += self.send_command(cmd, strip_prompt=False, strip_command=False, auto_find_prompt=False)
-            #time.sleep(delay_factor * .5)
+            output += self.send_command(cmd, strip_prompt=False, strip_command=False, auto_find_prompt=False, expect_string=pattern)
 
-        # Gather output
-        #output += self._read_channel_timing(delay_factor=delay_factor, max_loops=max_loops)
         if exit_config_mode:
             output += self.exit_config_mode()
-        #output = self._sanitize_output(output)
-        if debug:
-            print(output)
         return output
 
     @staticmethod
@@ -911,24 +838,13 @@ class BaseConnection(object):
 
         HP ProCurve's, Cisco SG300, and F5 LTM's require this (possible others)
         """
-        debug = False
-        if debug:
-            print("In strip_ansi_escape_codes")
-            print("repr = %s" % repr(string_buffer))
-
         code_next_line = chr(27) + r'E',           # code_next_line 
 
         output = string_buffer
-        #for ansi_esc_code in ANSI.code_set:
-            #output = ansi_esc_code.sub('', output)
         output = ANSI.code_regex.sub('', output)
 
         # CODE_NEXT_LINE must substitute with '\n'
         output = re.sub(ANSI.code_next_line, '\n', output)
-
-        if debug:
-            print("new_output = %s" % output)
-            print("repr = %s" % repr(output))
 
         return output
 
@@ -971,5 +887,4 @@ class ANSI:
                 code_disable_line_wrapping, code_erase_line_end,
                 code_reset_mode_screen_options, code_erase_display]
 
-    #code_set = [re.compile(code) for code in code_set]
     code_regex = re.compile('|'.join(code_set))

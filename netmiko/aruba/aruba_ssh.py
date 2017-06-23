@@ -9,8 +9,8 @@ class ArubaSSH(CiscoSSHConnection):
     """Aruba OS support"""
     def session_preparation(self):
         """Aruba OS requires enable mode to disable paging."""
-        delay_factor = self.select_delay_factor(delay_factor=0)
-        time.sleep(1 * delay_factor)
+        #delay_factor = self.select_delay_factor(delay_factor=0)
+        #time.sleep(1 * delay_factor)
         self._test_channel_read()
         self.set_base_prompt()
         self.enable()
@@ -22,7 +22,5 @@ class ArubaSSH(CiscoSSHConnection):
 
         Aruba uses "(<controller name>) (config) #" as config prompt
         """
-        if not pattern:
-            pattern = re.escape(self.base_prompt[:16])
         return super(ArubaSSH, self).check_config_mode(check_string=check_string,
                                                        pattern=pattern)

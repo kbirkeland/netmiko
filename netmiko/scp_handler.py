@@ -18,6 +18,9 @@ import io
 
 import scp
 
+from netmiko.ssh_exception import NetMikoTimeoutException, NetMikoAuthenticationException
+from netmiko import log
+
 
 class SCPConn(object):
     """
@@ -84,7 +87,11 @@ class FileTransfer(object):
         """Context manager cleanup."""
         self.close_scp_chan()
         if exc_type is not None:
-            raise exc_type(exc_value)
+            return False
+            #raise exc_type(exc_value)
+
+    def send_command(self, *args, **kwargs):
+        return self.ssh_ctl_conn.send_command(*args, **kwargs)
 
     def establish_scp_conn(self):
         """Establish SCP connection."""
@@ -98,9 +105,13 @@ class FileTransfer(object):
     def remote_space_available(self, search_pattern=r"bytes total \((.*) bytes free\)"):
         """Return space available on remote device."""
         remote_cmd = "dir {0}".format(self.file_system)
-        remote_output = self.ssh_ctl_chan.send_command_expect(remote_cmd)
+        remote_output = self.send_command(remote_cmd)
         match = re.search(search_pattern, remote_output)
-        return int(match.group(1))
+        if match:
+            return int(match.group(1))
+        else:
+            log.error('Could not determine available space on remote device ({!r})'.format(remote_output))
+            return 0
 
     def local_space_available(self):
         """Return space available on local filesystem."""
@@ -122,7 +133,7 @@ class FileTransfer(object):
         if self.direction == 'put':
             if not remote_cmd:
                 remote_cmd = "dir {0}/{1}".format(self.file_system, self.dest_file)
-            remote_out = self.ssh_ctl_chan.send_command_expect(remote_cmd)
+            remote_out = self.send_command(remote_cmd)
             search_string = r"Directory of .*{0}".format(self.dest_file)
             if 'Error opening' in remote_out:
                 return False
@@ -139,7 +150,7 @@ class FileTransfer(object):
             remote_file = self.dest_file
         if not remote_cmd:
             remote_cmd = "dir {0}/{1}".format(self.file_system, remote_file)
-        remote_out = self.ssh_ctl_chan.send_command_expect(remote_cmd)
+        remote_out = self.send_command(remote_cmd)
         # Strip out "Directory of flash:/filename line
         remote_out = re.split(r"Directory of .*", remote_out)
         remote_out = "".join(remote_out)
@@ -172,11 +183,11 @@ class FileTransfer(object):
         .MD5 of flash:file_name Done!
         verify /md5 (flash:file_name) = 410db2a7015eaa42b1fe71f1bf3d59a2
         """
-        match = re.search(pattern, md5_output)
-        if match:
-            return match.group(1)
-        else:
-            raise ValueError("Invalid output from MD5 command: {0}".format(md5_output))
+        for line in md5_output.split('\n'):
+            match = re.search(pattern, md5_output)
+            if match:
+                return match.group(1)
+        raise ValueError("Invalid output from MD5 command: {0}".format(md5_output))
 
     def compare_md5(self, base_cmd='verify /md5'):
         """Compare md5 of file on network device to md5 of local file"""
@@ -196,8 +207,15 @@ class FileTransfer(object):
         if remote_file is None:
             remote_file = self.dest_file
         remote_md5_cmd = "{0} {1}{2}".format(base_cmd, self.file_system, remote_file)
-        dest_md5 = self.ssh_ctl_chan.send_command_expect(remote_md5_cmd, delay_factor=3.0)
-        dest_md5 = self.process_md5(dest_md5)
+        try:
+            dest_md5 = self.send_command(remote_md5_cmd)
+        except NetMikoTimeoutException as e:
+            try:
+                dest_md5 = self.process_md5(str(e), pattern=r'= ([^\r\n ]+)')
+            except ValueError:
+                raise
+        else:
+            dest_md5 = self.process_md5(dest_md5)
         return dest_md5
 
     def transfer_file(self):
@@ -279,6 +297,8 @@ class InLineTransfer(FileTransfer):
         else:
             self.file_system = file_system
 
+        self.in_tclsh = False
+
     @staticmethod
     def _read_file(file_name):
         with io.open(file_name, "rt", encoding='utf-8') as f:
@@ -292,13 +312,18 @@ class InLineTransfer(FileTransfer):
         will convert the "\r" to a "\n" i.e. you will see a "\n" inside the file on the
         Cisco IOS device.
         """
-        NEWLINE = r"\n"
-        CARRIAGE_RETURN = r"\r"
-        tmp_string = re.sub(NEWLINE, CARRIAGE_RETURN, tcl_string)
+        tmp_string = re.sub(r'\n', r'\r', tcl_string)
         if re.search(r"[{}]", tmp_string):
             msg = "Curly brace detected in string; TCL requires this be escaped."
             raise ValueError(msg)
         return tmp_string
+
+    def send_command(self, *args, **kwargs):
+        if self.in_tclsh:
+            if 'tclquit' not in args[0]:
+                kwargs['expect_string'] = r'\n{}\(tcl\)#'.format(re.escape(self.ssh_ctl_chan.base_prompt))
+            kwargs['end'] = '\r'
+        return self.ssh_ctl_chan.send_command(*args, **kwargs)
 
     def __enter__(self):
         self._enter_tcl_mode()
@@ -307,27 +332,29 @@ class InLineTransfer(FileTransfer):
     def __exit__(self, exc_type, exc_value, traceback):
         _ = self._exit_tcl_mode()  # noqa
         if exc_type is not None:
-            raise exc_type(exc_value)
+            return False
 
     def _enter_tcl_mode(self):
+        if self.in_tclsh:
+            log.info('Already in tclsh.  Not executing _enter_tcl_mode()')
+            return ''
+
         TCL_ENTER = 'tclsh'
         cmd_failed = ['Translating "tclsh"', '% Unknown command', '% Bad IP address']
-        output = self.ssh_ctl_chan.send_command(TCL_ENTER, expect_string=r"\(tcl\)#",
-                                                strip_prompt=False, strip_command=False)
+        output = self.send_command(TCL_ENTER, strip_prompt=False, strip_command=False)
         for pattern in cmd_failed:
             if pattern in output:
                 raise ValueError("Failed to enter tclsh mode on router: {}".format(output))
+        self.in_tclsh = True
         return output
 
     def _exit_tcl_mode(self):
-        TCL_EXIT = 'tclquit'
-        self.ssh_ctl_chan.write_channel("\r")
-        time.sleep(1)
-        output = self.ssh_ctl_chan.read_channel()
-        if '(tcl)' in output:
-            self.ssh_ctl_chan.write_channel(TCL_EXIT + "\r")
-        time.sleep(1)
-        output += self.ssh_ctl_chan.read_channel()
+        if not self.in_tclsh:
+            log.info('Already left tclsh.  Not executing _exit_tcl_mode()')
+            return ''
+
+        output = self.send_command('tclquit')
+        self.in_tclsh = False
         return output
 
     def establish_scp_conn(self):
@@ -353,9 +380,10 @@ class InLineTransfer(FileTransfer):
         return hashlib.md5(file_contents).hexdigest()
 
     def put_file(self):
-        curlybrace = r'{'
+        self._enter_tcl_mode()
+
         TCL_FILECMD_ENTER = 'puts [open "{}{}" w+] {}'.format(self.file_system,
-                                                              self.dest_file, curlybrace)
+                                                              self.dest_file, '{')
         TCL_FILECMD_EXIT = '}'
 
         if self.source_file:
@@ -370,31 +398,21 @@ class InLineTransfer(FileTransfer):
         self.ssh_ctl_chan.write_channel(TCL_FILECMD_ENTER)
         time.sleep(.25)
         self.ssh_ctl_chan.write_channel(file_contents)
-        self.ssh_ctl_chan.write_channel(TCL_FILECMD_EXIT + "\r")
 
         # This operation can be slow (depends on the size of the file)
-        max_loops = 400
-        sleep_time = 4
+        #max_loops = 400
+        timeout = 30
         if self.file_size >= 2500:
-            max_loops = 1500
-            sleep_time = 12
+            timeout = 120
         elif self.file_size >= 7500:
-            max_loops = 3000
-            sleep_time = 25
-
-        # Initial delay
-        time.sleep(sleep_time)
+            timeout = 300
 
         # File paste and TCL_FILECMD_exit should be indicated by "router(tcl)#"
-        output = self.ssh_ctl_chan._read_channel_expect(pattern=r"\(tcl\)", max_loops=max_loops)
+        output = self.send_command(TCL_FILECMD_EXIT, timeout=timeout)
 
         # The file doesn't write until tclquit
-        TCL_EXIT = 'tclquit'
-        self.ssh_ctl_chan.write_channel(TCL_EXIT + "\r")
+        output += self._exit_tcl_mode()
 
-        time.sleep(1)
-        # Read all data remaining from the TCLSH session
-        output += self.ssh_ctl_chan._read_channel_expect(max_loops=max_loops)
         return output
 
     def get_file(self):
