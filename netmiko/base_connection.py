@@ -35,7 +35,7 @@ class BaseConnection(object):
     Otherwise method left as a stub method.
     """
     def __init__(self, ip='', host='', username='', password='', secret='', port=None,
-                 device_type='', verbose=False, global_delay_factor=1, use_keys=False,
+                 device_type='', verbose=False, use_keys=False,
                  key_file=None, allow_agent=False, ssh_strict=False, system_host_keys=False,
                  alt_host_keys=False, alt_key_file='', ssh_config_file=None, timeout=15,
                  session_timeout=60, keepalive=0, prompt_terminators=['>', '#']):
@@ -63,8 +63,6 @@ class BaseConnection(object):
         :type device_type: str
         :param verbose: Enable additional messages to standard output.
         :type verbose: bool
-        :param global_delay_factor: Multiplication factor affecting Netmiko delays (default: 1).
-        :type global_delay_factor: int
         :param use_keys: Connect to target device using SSH keys.
         :type use_keys: bool
         :param key_file: Filename path of the SSH key file to use.
@@ -118,9 +116,6 @@ class BaseConnection(object):
         self.session_timeout = session_timeout
         self.keepalive = keepalive
         self.prompt_terminators = prompt_terminators
-
-        # Use the greater of global_delay_factor or delay_factor local to method
-        self.global_delay_factor = global_delay_factor
 
         # set in set_base_prompt method
         self.base_prompt = ''
@@ -308,7 +303,7 @@ class BaseConnection(object):
         Attempt to read channel max_loops number of times. If no data this will cause a 15 second
         delay.
 
-        Once data is encountered read channel for another two seconds (2 * delay_factor) to make
+        Once data is encountered read channel for another two seconds to make
         sure reading of channel is complete.
         """
         output = self.read_channel(timeout=timeout)
@@ -334,11 +329,11 @@ class BaseConnection(object):
     def telnet_login(self, username_pattern=r'sername', pwd_pattern=r'assword',
                      timeout=None):
         login_pattern = '({}|{})'.format(re.escape(username_pattern),
-                                         re.escape_pwd_pattern)
+                                         re.escape(pwd_pattern))
         try:
             output = self._read_channel_expect(pattern=login_pattern)
             if username_pattern in output:
-                output = send_command(self.username, expect_string=login_pattern)
+                output = self.send_command(self.username, expect_string=login_pattern)
             if pwd_pattern in output:
                 output = self.send_command(self.password, auto_find_prompt=True)
 
@@ -502,18 +497,11 @@ class BaseConnection(object):
         remote_conn_pre.set_missing_host_key_policy(self.key_policy)
         return remote_conn_pre
 
-    def select_delay_factor(self, delay_factor):
-        """Choose the greater of delay_factor or self.global_delay_factor."""
-        if delay_factor >= self.global_delay_factor:
-            return delay_factor
-        else:
-            return self.global_delay_factor
-
-    def special_login_handler(self, delay_factor=1):
+    def special_login_handler(self):
         """Handler for devices like WLC, Avaya ERS that throw up characters prior to login."""
         pass
 
-    def disable_paging(self, command="terminal length 0", delay_factor=1):
+    def disable_paging(self, command="terminal length 0"):
         """Disable paging default to a Cisco CLI method."""
         return self.send_command(command)
 
@@ -607,7 +595,6 @@ class BaseConnection(object):
         :type normalize: bool
         """
         output = ''
-        delay_factor = self.select_delay_factor(delay_factor)
         self.clear_buffer()
         if normalize:
             command_string = self.normalize_cmd(command_string)
@@ -655,7 +642,7 @@ class BaseConnection(object):
             expect_string_arg = expect_string
             expect_string = self._prompt_pattern(prompt='')
 
-        if not end:
+        if end is None:
             end = self.end
 
         if normalize:
@@ -784,8 +771,8 @@ class BaseConnection(object):
         with io.open(config_file, "rt", encoding='utf-8') as cfg_file:
             return self.send_config_set(cfg_file, **kwargs)
 
-    def send_config_set(self, config_commands=None, exit_config_mode=True, delay_factor=1,
-                        max_loops=150, strip_prompt=False, strip_command=False):
+    def send_config_set(self, config_commands=None, exit_config_mode=True,
+                        timeout=None, strip_prompt=False, strip_command=False):
         """
         Send configuration commands down the SSH channel.
 
@@ -795,7 +782,6 @@ class BaseConnection(object):
         Automatically exits/enters configuration mode.
         """
         pattern = self._config_prompt_pattern()
-        delay_factor = self.select_delay_factor(delay_factor)
         if config_commands is None:
             return ''
         elif isinstance(config_commands, string_types):
@@ -807,7 +793,7 @@ class BaseConnection(object):
         # Send config commands
         output = self.config_mode()
         for cmd in config_commands:
-            output += self.send_command(cmd, strip_prompt=False, strip_command=False, auto_find_prompt=False, expect_string=pattern)
+            output += self.send_command(cmd, strip_prompt=False, strip_command=False, auto_find_prompt=False, expect_string=pattern, timeout=timeout)
 
         if exit_config_mode:
             output += self.exit_config_mode()
