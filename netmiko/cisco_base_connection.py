@@ -21,14 +21,16 @@ class CiscoBaseConnection(BaseConnection):
         """Exits enable (privileged exec) mode."""
         return super(CiscoBaseConnection, self).exit_enable_mode(exit_command=exit_command)
 
+    def _config_prompt_pattern(self):
+        """
+        Cisco IOS devices abbreviate the prompt at 20 chars in config mode
+        """
+        return self._prompt_pattern(prompt=self.base_prompt[:15])
+
     def check_config_mode(self, check_string=')#', pattern=''):
         """
         Checks if the device is in configuration mode or not.
-
-        Cisco IOS devices abbreviate the prompt at 20 chars in config mode
         """
-        if not pattern:
-            pattern = re.escape(self.base_prompt[:16])
         return super(CiscoBaseConnection, self).check_config_mode(check_string=check_string,
                                                                   pattern=pattern)
 
@@ -36,17 +38,12 @@ class CiscoBaseConnection(BaseConnection):
         """
         Enter into configuration mode on remote device.
 
-        Cisco IOS devices abbreviate the prompt at 20 chars in config mode
         """
-        if not pattern:
-            pattern = re.escape(self.base_prompt[:16])
         return super(CiscoBaseConnection, self).config_mode(config_command=config_command,
                                                             pattern=pattern)
 
     def exit_config_mode(self, exit_config='end', pattern=''):
         """Exit from configuration mode."""
-        if not pattern:
-            pattern = re.escape(self.base_prompt[:16])
         return super(CiscoBaseConnection, self).exit_config_mode(exit_config=exit_config,
                                                                  pattern=pattern)
 
@@ -62,82 +59,38 @@ class CiscoBaseConnection(BaseConnection):
             return self.telnet_login(pri_prompt_terminator, alt_prompt_terminator,
                                      username_pattern, pwd_pattern, delay_factor, max_loops)
 
-    def telnet_login(self, pri_prompt_terminator=r'#\s*$', alt_prompt_terminator=r'>\s*$',
-                     username_pattern=r"(?:[Uu]ser:|sername|ogin|User Name)",
-                     pwd_pattern=r"assword",
-                     delay_factor=1, max_loops=20):
-        """Telnet login. Can be username/password or just password."""
-        delay_factor = self.select_delay_factor(delay_factor)
-        time.sleep(1 * delay_factor)
+    def telnet_login(self, username_pattern=r'sername', pwd_pattern=r'assword',
+                     timeout=None):
+        login_pattern = '({}|{})'.format(re.escape(username_pattern),
+                                         re.escape_pwd_pattern)
+        try:
+            output = self._read_channel_expect(pattern=login_pattern)
+            if username_pattern in output:
+                output = send_command(self.username, expect_string=login_pattern)
+            if pwd_pattern in output:
+                output = self.send_command(self.password, auto_find_prompt=True)
 
-        output = ''
-        return_msg = ''
-        i = 1
-        while i <= max_loops:
-            try:
-                output = self.read_channel()
-                return_msg += output
+            if self.base_prompt:
+                return output
 
-                # Search for username pattern / send username
-                if re.search(username_pattern, output):
-                    self.write_channel(self.username + self.TELNET_RETURN)
-                    time.sleep(1 * delay_factor)
-                    output = self.read_channel()
-                    return_msg += output
+            if re.search(r"initial configuration dialog\? \[yes/no\]: ", output):
+                output = self.send_command('no', expect_string=r'ress RETURN to get started', timeout=30)
+                output = self.send_command('', auto_find_prompt=True)
 
-                # Search for password pattern / send password
-                if re.search(pwd_pattern, output):
-                    self.write_channel(self.password + self.TELNET_RETURN)
-                    time.sleep(.5 * delay_factor)
-                    output = self.read_channel()
-                    return_msg += output
-                    if (re.search(pri_prompt_terminator, output, flags=re.M)
-                            or re.search(alt_prompt_terminator, output, flags=re.M)):
-                        return return_msg
-
-                # Support direct telnet through terminal server
-                if re.search(r"initial configuration dialog\? \[yes/no\]: ", output):
-                    self.write_channel("no" + self.TELNET_RETURN)
-                    time.sleep(.5 * delay_factor)
-                    count = 0
-                    while count < 15:
-                        output = self.read_channel()
-                        return_msg += output
-                        if re.search(r"ress RETURN to get started", output):
-                            output = ""
-                            break
-                        time.sleep(2 * delay_factor)
-                        count += 1
-
-                # Check for device with no password configured
-                if re.search(r"assword required, but none set", output):
-                    msg = "Telnet login failed - Password required, but none set: {}".format(
+            if re.search(r'assword required, but none set', output):
+                msg = "Telnet login failed - Password required, but none set: {0}".format(
                         self.host)
-                    raise NetMikoAuthenticationException(msg)
-
-                # Check if proper data received
-                if (re.search(pri_prompt_terminator, output, flags=re.M)
-                        or re.search(alt_prompt_terminator, output, flags=re.M)):
-                    return return_msg
-
-                self.write_channel(self.TELNET_RETURN)
-                time.sleep(.5 * delay_factor)
-                i += 1
-            except EOFError:
-                msg = "Telnet login failed: {}".format(self.host)
                 raise NetMikoAuthenticationException(msg)
 
-        # Last try to see if we already logged in
-        self.write_channel(self.TELNET_RETURN)
-        time.sleep(.5 * delay_factor)
-        output = self.read_channel()
-        return_msg += output
-        if (re.search(pri_prompt_terminator, output, flags=re.M)
-                or re.search(alt_prompt_terminator, output, flags=re.M)):
-            return return_msg
+            if not self.base_prompt:
+                msg = 'Telnet login failed to find prompt: {0}'.format(self.host)
+                raise NetMikoAuthenticationException(msg)
 
-        msg = "Telnet login failed: {}".format(self.host)
-        raise NetMikoAuthenticationException(msg)
+            return output
+
+        except (socket.error, EOFError):
+            msg = 'Telnet login failed: {0}'.format(self.host)
+            raise NetMikoAuthenticationException(msg)
 
     def cleanup(self):
         """Gracefully exit the SSH session."""

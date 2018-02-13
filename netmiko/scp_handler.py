@@ -16,6 +16,9 @@ import hashlib
 
 import scp
 
+from netmiko.ssh_exception import NetMikoTimeoutException, NetMikoAuthenticationException
+from netmiko import log
+
 
 class SCPConn(object):
     """
@@ -81,6 +84,12 @@ class BaseFileTransfer(object):
     def __exit__(self, exc_type, exc_value, traceback):
         """Context manager cleanup."""
         self.close_scp_chan()
+        if exc_type is not None:
+            return False
+            #raise exc_type(exc_value)
+
+    def send_command(self, *args, **kwargs):
+        return self.ssh_ctl_conn.send_command(*args, **kwargs)
 
     def establish_scp_conn(self):
         """Establish SCP connection."""
@@ -93,10 +102,14 @@ class BaseFileTransfer(object):
 
     def remote_space_available(self, search_pattern=r"(\d+) bytes free"):
         """Return space available on remote device."""
-        remote_cmd = "dir {}".format(self.file_system)
-        remote_output = self.ssh_ctl_chan.send_command_expect(remote_cmd)
+        remote_cmd = "dir {0}".format(self.file_system)
+        remote_output = self.send_command(remote_cmd)
         match = re.search(search_pattern, remote_output)
-        return int(match.group(1))
+        if match:
+            return int(match.group(1))
+        else:
+            log.error('Could not determine available space on remote device ({!r})'.format(remote_output))
+            return 0
 
     def local_space_available(self):
         """Return space available on local filesystem."""
@@ -118,7 +131,7 @@ class BaseFileTransfer(object):
         if self.direction == 'put':
             if not remote_cmd:
                 remote_cmd = "dir {0}/{1}".format(self.file_system, self.dest_file)
-            remote_out = self.ssh_ctl_chan.send_command_expect(remote_cmd)
+            remote_out = self.send_command(remote_cmd)
             search_string = r"Directory of .*{0}".format(self.dest_file)
             if 'Error opening' in remote_out:
                 return False
@@ -137,8 +150,8 @@ class BaseFileTransfer(object):
             elif self.direction == 'get':
                 remote_file = self.source_file
         if not remote_cmd:
-            remote_cmd = "dir {}/{}".format(self.file_system, remote_file)
-        remote_out = self.ssh_ctl_chan.send_command(remote_cmd)
+            remote_cmd = "dir {0}/{1}".format(self.file_system, remote_file)
+        remote_out = self.send_command(remote_cmd)
         # Strip out "Directory of flash:/filename line
         remote_out = re.split(r"Directory of .*", remote_out)
         remote_out = "".join(remote_out)
@@ -171,11 +184,11 @@ class BaseFileTransfer(object):
         .MD5 of flash:file_name Done!
         verify /md5 (flash:file_name) = 410db2a7015eaa42b1fe71f1bf3d59a2
         """
-        match = re.search(pattern, md5_output)
-        if match:
-            return match.group(1)
-        else:
-            raise ValueError("Invalid output from MD5 command: {0}".format(md5_output))
+        for line in md5_output.split('\n'):
+            match = re.search(pattern, md5_output)
+            if match:
+                return match.group(1)
+        raise ValueError("Invalid output from MD5 command: {0}".format(md5_output))
 
     def compare_md5(self):
         """Compare md5 of file on network device to md5 of local file."""
@@ -197,8 +210,15 @@ class BaseFileTransfer(object):
             elif self.direction == 'get':
                 remote_file = self.source_file
         remote_md5_cmd = "{0} {1}{2}".format(base_cmd, self.file_system, remote_file)
-        dest_md5 = self.ssh_ctl_chan.send_command(remote_md5_cmd, delay_factor=3.0)
-        dest_md5 = self.process_md5(dest_md5)
+        try:
+            dest_md5 = self.send_command(remote_md5_cmd)
+        except NetMikoTimeoutException as e:
+            try:
+                dest_md5 = self.process_md5(str(e), pattern=r'= ([^\r\n ]+)')
+            except ValueError:
+                raise
+        else:
+            dest_md5 = self.process_md5(dest_md5)
         return dest_md5
 
     def transfer_file(self):
@@ -249,3 +269,160 @@ class BaseFileTransfer(object):
         elif not hasattr(cmd, '__iter__'):
             cmd = [cmd]
         self.ssh_ctl_chan.send_config_set(cmd)
+
+
+class InLineTransfer(FileTransfer):
+    """Use TCL on Cisco IOS to directly transfer file."""
+    def __init__(self, ssh_conn, source_file=None, dest_file=None, file_system=None,
+                 direction='put', source_config=None):
+        if source_file and source_config:
+            msg = "Invalid call to InLineTransfer both source_file and source_config specified."
+            raise ValueError(msg)
+        if direction != 'put':
+            raise ValueError("Only put operation supported by InLineTransfer.")
+
+        self.ssh_ctl_chan = ssh_conn
+        if source_file:
+            self.source_file = source_file
+            self.source_config = None
+            self.source_md5 = self.file_md5(source_file)
+            self.file_size = os.stat(source_file).st_size
+        elif source_config:
+            self.source_file = None
+            self.source_config = source_config
+            self.source_md5 = self.config_md5(source_config)
+            self.file_size = len(source_config.encode('UTF-8'))
+        self.dest_file = dest_file
+        self.direction = direction
+
+        if not file_system:
+            self.file_system = self.ssh_ctl_chan._autodetect_fs()
+        else:
+            self.file_system = file_system
+
+        self.in_tclsh = False
+
+    @staticmethod
+    def _read_file(file_name):
+        with io.open(file_name, "rt", encoding='utf-8') as f:
+            return f.read()
+
+    @staticmethod
+    def _tcl_newline_rationalize(tcl_string):
+        """
+        When using put inside a TCL {} section the newline is considered a new TCL
+        statement and causes a missing curly-brace message. Convert "\n" to "\r". TCL
+        will convert the "\r" to a "\n" i.e. you will see a "\n" inside the file on the
+        Cisco IOS device.
+        """
+        tmp_string = re.sub(r'\n', r'\r', tcl_string)
+        if re.search(r"[{}]", tmp_string):
+            msg = "Curly brace detected in string; TCL requires this be escaped."
+            raise ValueError(msg)
+        return tmp_string
+
+    def send_command(self, *args, **kwargs):
+        if self.in_tclsh:
+            if 'tclquit' not in args[0]:
+                kwargs['expect_string'] = r'\n{}\(tcl\)#'.format(re.escape(self.ssh_ctl_chan.base_prompt))
+            kwargs['end'] = '\r'
+        return self.ssh_ctl_chan.send_command(*args, **kwargs)
+
+    def __enter__(self):
+        self._enter_tcl_mode()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        _ = self._exit_tcl_mode()  # noqa
+        if exc_type is not None:
+            return False
+
+    def _enter_tcl_mode(self):
+        if self.in_tclsh:
+            log.info('Already in tclsh.  Not executing _enter_tcl_mode()')
+            return ''
+
+        TCL_ENTER = 'tclsh'
+        cmd_failed = ['Translating "tclsh"', '% Unknown command', '% Bad IP address']
+        output = self.send_command(TCL_ENTER, strip_prompt=False, strip_command=False)
+        for pattern in cmd_failed:
+            if pattern in output:
+                raise ValueError("Failed to enter tclsh mode on router: {}".format(output))
+        self.in_tclsh = True
+        return output
+
+    def _exit_tcl_mode(self):
+        if not self.in_tclsh:
+            log.info('Already left tclsh.  Not executing _exit_tcl_mode()')
+            return ''
+
+        output = self.send_command('tclquit')
+        self.in_tclsh = False
+        return output
+
+    def establish_scp_conn(self):
+        raise NotImplementedError
+
+    def close_scp_chan(self):
+        raise NotImplementedError
+
+    def local_space_available(self):
+        raise NotImplementedError
+
+    def file_md5(self, file_name):
+        """Compute MD5 hash of file."""
+        file_contents = self._read_file(file_name)
+        file_contents = file_contents + '\n'    # Cisco IOS automatically adds this
+        file_contents = file_contents.encode('UTF-8')
+        return hashlib.md5(file_contents).hexdigest()
+
+    def config_md5(self, source_config):
+        """Compute MD5 hash of file."""
+        file_contents = source_config + '\n'    # Cisco IOS automatically adds this
+        file_contents = file_contents.encode('UTF-8')
+        return hashlib.md5(file_contents).hexdigest()
+
+    def put_file(self):
+        self._enter_tcl_mode()
+
+        TCL_FILECMD_ENTER = 'puts [open "{}{}" w+] {}'.format(self.file_system,
+                                                              self.dest_file, '{')
+        TCL_FILECMD_EXIT = '}'
+
+        if self.source_file:
+            file_contents = self._read_file(self.source_file)
+        elif self.source_config:
+            file_contents = self.source_config
+        file_contents = self._tcl_newline_rationalize(file_contents)
+
+        # Try to remove any existing data
+        self.ssh_ctl_chan.clear_buffer()
+
+        self.ssh_ctl_chan.write_channel(TCL_FILECMD_ENTER)
+        time.sleep(.25)
+        self.ssh_ctl_chan.write_channel(file_contents)
+
+        # This operation can be slow (depends on the size of the file)
+        #max_loops = 400
+        timeout = 30
+        if self.file_size >= 2500:
+            timeout = 120
+        elif self.file_size >= 7500:
+            timeout = 300
+
+        # File paste and TCL_FILECMD_exit should be indicated by "router(tcl)#"
+        output = self.send_command(TCL_FILECMD_EXIT, timeout=timeout)
+
+        # The file doesn't write until tclquit
+        output += self._exit_tcl_mode()
+
+        return output
+
+    def get_file(self):
+        raise NotImplementedError
+
+    def enable_scp(self, cmd=None):
+        raise NotImplementedError
+
+    def disable_scp(self, cmd=None):
+        raise NotImplementedError
