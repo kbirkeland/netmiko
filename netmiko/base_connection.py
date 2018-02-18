@@ -538,8 +538,8 @@ class BaseConnection(object):
         if prompt is None:
             prompt = self.base_prompt
         if len(self.prompt_terminators) > 0:
-            return '\n{}.*[{}]'.format(re.escape(prompt), ''.join(self.prompt_terminators))
-        return '\n{}'.format(re.escape(prompt))
+            return '\n{}.*[{}]'.format(prompt, ''.join(self.prompt_terminators))
+        return '\n{}'.format(prompt)
         
     def _config_prompt_pattern(self):
         """
