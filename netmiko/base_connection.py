@@ -549,7 +549,7 @@ class BaseConnection(object):
 
     def _find_prompt(self, timeout=None):
         self.clear_buffer()
-        prompt = self.send_command('', expect_string='\n[^\n]*({})'.format('|'.join(self.prompt_terminators)), timeout=timeout)
+        prompt = self.send_command('', expect_string='\n[^\n]*({})'.format('|'.join(self.prompt_terminators)), timeout=timeout, strip_prompt=False)
         if self.ansi_escape_codes:
             prompt = self.strip_ansi_escape_codes(prompt)
         return prompt.strip()
