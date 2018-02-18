@@ -12,8 +12,8 @@ class LinuxSSH(CiscoSSHConnection):
 
     def __init__(self, *args, **kwargs):
         if 'prompt_terminators' not in kwargs:
-            kwargs['prompt_terminators'] = ['$', '#', '%', '>']
-        return super(CiscoSSHConnection, self).__init__(*args, **kwargs)
+            kwargs['prompt_terminators'] = ['\$', '#', '%', '>']
+        return super(LinuxSSH, self).__init__(*args, **kwargs)
 
     def disable_paging(self, *args, **kwargs):
         """Linux doesn't have paging by default."""
@@ -47,27 +47,16 @@ class LinuxSSH(CiscoSSHConnection):
         delay_factor = self.select_delay_factor(delay_factor=0)
         output = ""
         if self.check_enable_mode():
-            self.write_channel(self.normalize_cmd(exit_command))
-            time.sleep(.3 * delay_factor)
-            self.set_base_prompt()
+            self.send_command(exit_command, auto_find_prompt=True)
             if self.check_enable_mode():
                 raise ValueError("Failed to exit enable mode.")
         return output
 
     def enable(self, cmd='sudo su', pattern='ssword', re_flags=re.IGNORECASE):
         """Attempt to become root."""
-        delay_factor = self.select_delay_factor(delay_factor=0)
         output = ""
         if not self.check_enable_mode():
-            self.write_channel(self.normalize_cmd(cmd))
-            time.sleep(.3 * delay_factor)
-            try:
-                output += self.read_channel()
-                if re.search(pattern, output, flags=re_flags):
-                    self.write_channel(self.normalize_cmd(self.secret))
-                self.set_base_prompt()
-            except socket.timeout:
-                raise NetMikoTimeoutException("Timed-out reading channel, data not available.")
+            output = self.send_command(cmd, auto_find_prompt=True)
             if not self.check_enable_mode():
                 raise ValueError("Failed to enter enable mode.")
         return output
